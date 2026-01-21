@@ -45,6 +45,7 @@ from lerobot.model.kinematics import RobotKinematics
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_so_follower,
+    fr3_follower,
     koch_follower,
     make_robot_from_config,
     omx_follower,
@@ -53,6 +54,7 @@ from lerobot.robots import (  # noqa: F401
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_so_leader,
+    fr3_leader,
     gamepad,
     koch_leader,
     make_teleoperator_from_config,
