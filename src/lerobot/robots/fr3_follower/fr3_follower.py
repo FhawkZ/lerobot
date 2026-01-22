@@ -58,6 +58,10 @@ class FR3Follower(Robot):
     @property
     def observation_features(self) -> dict[str, type]:
         features = {f"{joint}.pos": float for joint in self.config.joint_names}
+        # Add joint velocities
+        features.update({f"{joint}.vel": float for joint in self.config.joint_names})
+        # Add joint torques (efforts)
+        features.update({f"{joint}.torque": float for joint in self.config.joint_names})
         if self.config.use_gripper:
             features["gripper.width"] = float
         return features
@@ -155,6 +159,54 @@ class FR3Follower(Robot):
 
         return [float(pos) for pos in msg.position[: len(self.config.joint_names)]]
 
+    def _ordered_joint_velocities(self) -> list[float]:
+        """Extract joint velocities from JointState message in the correct order."""
+        with self._lock:
+            msg = self._joint_state_msg
+        if msg is None:
+            raise RuntimeError("Joint state is not available")
+
+        if not msg.velocity:
+            # If velocity is not available, return zeros
+            return [0.0] * len(self.config.joint_names)
+
+        if msg.name and len(msg.name) == len(msg.velocity):
+            name_to_vel = {name: vel for name, vel in zip(msg.name, msg.velocity)}
+            return [float(name_to_vel.get(joint, 0.0)) for joint in self.config.joint_names]
+
+        if len(msg.velocity) < len(self.config.joint_names):
+            # If fewer velocities than expected, pad with zeros
+            velocities = [float(vel) for vel in msg.velocity[: len(self.config.joint_names)]]
+            while len(velocities) < len(self.config.joint_names):
+                velocities.append(0.0)
+            return velocities
+
+        return [float(vel) for vel in msg.velocity[: len(self.config.joint_names)]]
+
+    def _ordered_joint_efforts(self) -> list[float]:
+        """Extract joint efforts (torques) from JointState message in the correct order."""
+        with self._lock:
+            msg = self._joint_state_msg
+        if msg is None:
+            raise RuntimeError("Joint state is not available")
+
+        if not msg.effort:
+            # If effort is not available, return zeros
+            return [0.0] * len(self.config.joint_names)
+
+        if msg.name and len(msg.name) == len(msg.effort):
+            name_to_effort = {name: effort for name, effort in zip(msg.name, msg.effort)}
+            return [float(name_to_effort.get(joint, 0.0)) for joint in self.config.joint_names]
+
+        if len(msg.effort) < len(self.config.joint_names):
+            # If fewer efforts than expected, pad with zeros
+            efforts = [float(effort) for effort in msg.effort[: len(self.config.joint_names)]]
+            while len(efforts) < len(self.config.joint_names):
+                efforts.append(0.0)
+            return efforts
+
+        return [float(effort) for effort in msg.effort[: len(self.config.joint_names)]]
+
     def _gripper_width(self) -> Optional[float]:
         with self._lock:
             msg = self._gripper_state_msg
@@ -174,9 +226,20 @@ class FR3Follower(Robot):
 
         self._wait_for_state(require_gripper=self.config.use_gripper)
         joint_positions = self._ordered_joint_positions()
+        joint_velocities = self._ordered_joint_velocities()
+        joint_efforts = self._ordered_joint_efforts()
+        
         obs = {
             f"{joint}.pos": joint_positions[idx] for idx, joint in enumerate(self.config.joint_names)
         }
+        # Add joint velocities to observation
+        obs.update({
+            f"{joint}.vel": joint_velocities[idx] for idx, joint in enumerate(self.config.joint_names)
+        })
+        # Add joint torques (efforts) to observation
+        obs.update({
+            f"{joint}.torque": joint_efforts[idx] for idx, joint in enumerate(self.config.joint_names)
+        })
 
         if self.config.use_gripper:
             gripper_width = self._gripper_width()

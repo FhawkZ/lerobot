@@ -39,6 +39,8 @@ from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.tavla.configuration_tavla import TavlaConfig
+from lerobot.policies.tavla05.configuration_tavla05 import Tavla05Config
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
@@ -67,7 +69,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
     Args:
         name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
-              "vqbet", "pi0", "pi05", "sac", "reward_classifier", "smolvla", "wall_x".
+              "vqbet", "pi0", "pi05", "sac", "reward_classifier", "smolvla", "tavla",
+              "tavla05", "wall_x".
 
     Returns:
         The policy class corresponding to the given name.
@@ -127,6 +130,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 
         return XVLAPolicy
+    elif name == "tavla":
+        from lerobot.policies.tavla.modeling_tavla import TavlaPolicy
+
+        return TavlaPolicy
+    elif name == "tavla05":
+        from lerobot.policies.tavla05.modeling_tavla import TavlaPolicyPI05
+
+        return TavlaPolicyPI05
     elif name == "wall_x":
         from lerobot.policies.wall_x.modeling_wall_x import WallXPolicy
 
@@ -148,7 +159,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
                      "diffusion", "act", "vqbet", "pi0", "pi05", "sac", "smolvla",
-                     "reward_classifier", "wall_x".
+                     "tavla", "tavla05", "reward_classifier", "wall_x".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
     Returns:
@@ -179,6 +190,10 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return GrootConfig(**kwargs)
     elif policy_type == "xvla":
         return XVLAConfig(**kwargs)
+    elif policy_type == "tavla":
+        return TavlaConfig(**kwargs)
+    elif policy_type == "tavla05":
+        return Tavla05Config(**kwargs)
     elif policy_type == "wall_x":
         return WallXConfig(**kwargs)
     else:
@@ -379,6 +394,22 @@ def make_pre_post_processors(
         )
 
         processors = make_xvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, TavlaConfig):
+        from lerobot.policies.tavla.processor_tavla import make_tavla_pre_post_processors
+
+        processors = make_tavla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, Tavla05Config):
+        from lerobot.policies.tavla05.processor_tavla05 import make_tavla05_pre_post_processors
+
+        processors = make_tavla05_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

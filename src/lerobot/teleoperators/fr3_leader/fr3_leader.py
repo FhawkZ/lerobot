@@ -141,6 +141,54 @@ class FR3Leader(Teleoperator):
 
         return [float(pos) for pos in msg.position[: len(self.config.joint_names)]]
 
+    def _ordered_joint_velocities(self) -> list[float]:
+        """Extract joint velocities from JointState message in the correct order."""
+        with self._lock:
+            msg = self._joint_state_msg
+        if msg is None:
+            raise RuntimeError("Joint state is not available")
+
+        if not msg.velocity:
+            # If velocity is not available, return zeros
+            return [0.0] * len(self.config.joint_names)
+
+        if msg.name and len(msg.name) == len(msg.velocity):
+            name_to_vel = {name: vel for name, vel in zip(msg.name, msg.velocity)}
+            return [float(name_to_vel.get(joint, 0.0)) for joint in self.config.joint_names]
+
+        if len(msg.velocity) < len(self.config.joint_names):
+            # If fewer velocities than expected, pad with zeros
+            velocities = [float(vel) for vel in msg.velocity[: len(self.config.joint_names)]]
+            while len(velocities) < len(self.config.joint_names):
+                velocities.append(0.0)
+            return velocities
+
+        return [float(vel) for vel in msg.velocity[: len(self.config.joint_names)]]
+
+    def _ordered_joint_efforts(self) -> list[float]:
+        """Extract joint efforts (torques) from JointState message in the correct order."""
+        with self._lock:
+            msg = self._joint_state_msg
+        if msg is None:
+            raise RuntimeError("Joint state is not available")
+
+        if not msg.effort:
+            # If effort is not available, return zeros
+            return [0.0] * len(self.config.joint_names)
+
+        if msg.name and len(msg.name) == len(msg.effort):
+            name_to_effort = {name: effort for name, effort in zip(msg.name, msg.effort)}
+            return [float(name_to_effort.get(joint, 0.0)) for joint in self.config.joint_names]
+
+        if len(msg.effort) < len(self.config.joint_names):
+            # If fewer efforts than expected, pad with zeros
+            efforts = [float(effort) for effort in msg.effort[: len(self.config.joint_names)]]
+            while len(efforts) < len(self.config.joint_names):
+                efforts.append(0.0)
+            return efforts
+
+        return [float(effort) for effort in msg.effort[: len(self.config.joint_names)]]
+
     def _gripper_width(self) -> Optional[float]:
         with self._lock:
             msg = self._gripper_state_msg
