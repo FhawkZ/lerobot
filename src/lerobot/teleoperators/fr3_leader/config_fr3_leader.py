@@ -38,6 +38,11 @@ class FR3LeaderConfig(TeleoperatorConfig):
         ]
     )
     use_gripper: bool = True
-    gripper_width_scale: float = 1.0
+    gripper_width_scale: float = 0.5
+    gripper_delta_epsilon: float = 1e-3
     timeout_s: float = 5.0
+    # Use keyboard to toggle gripper (avoids moving leader gripper by hand). Does not conflict with record keys (Right/Left/Esc).
+    gripper_keyboard_enable: bool = True
+    gripper_close_key: str = "1"
+    gripper_open_key: str = "2"
 

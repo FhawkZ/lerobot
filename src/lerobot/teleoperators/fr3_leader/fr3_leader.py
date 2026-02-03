@@ -48,6 +48,8 @@ class FR3Leader(Teleoperator):
         self._lock = threading.Lock()
         self._joint_state_msg: Optional[JointState] = None
         self._gripper_state_msg: Optional[JointState] = None
+        self._gripper_binary_state: int = 0
+        self._gripper_keyboard_listener: Optional[object] = None
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -87,6 +89,9 @@ class FR3Leader(Teleoperator):
         self._executor.add_node(self._node)
         self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
         self._spin_thread.start()
+
+        if self.config.use_gripper and getattr(self.config, "gripper_keyboard_enable", False):
+            self._start_gripper_keyboard_listener()
 
         self._connected = True
         logger.info(
@@ -202,21 +207,66 @@ class FR3Leader(Teleoperator):
 
         return width * self.config.gripper_width_scale
 
+    def _start_gripper_keyboard_listener(self) -> None:
+        try:
+            from lerobot.utils.control_utils import is_headless
+
+            if is_headless():
+                logger.warning("Headless: gripper keyboard disabled.")
+                return
+        except Exception:
+            logger.warning("Could not check headless: gripper keyboard disabled.")
+            return
+        try:
+            from pynput import keyboard
+        except ImportError:
+            logger.warning("pynput not available: gripper keyboard disabled.")
+            return
+        close_key = getattr(self.config, "gripper_close_key", "1")
+        open_key = getattr(self.config, "gripper_open_key", "2")
+
+        def on_press(key):
+            if not hasattr(key, "char"):
+                return
+            if key.char == close_key:
+                self._gripper_binary_state = 1
+                logger.debug("Gripper keyboard: close (1)")
+            elif key.char == open_key:
+                self._gripper_binary_state = 0
+                logger.debug("Gripper keyboard: open (0)")
+
+        self._gripper_keyboard_listener = keyboard.Listener(on_press=on_press)
+        self._gripper_keyboard_listener.start()
+        logger.info("Gripper keyboard: %s=close, %s=open (no conflict with record Right/Left/Esc)", close_key, open_key)
+
+    def _stop_gripper_keyboard_listener(self) -> None:
+        if self._gripper_keyboard_listener is not None:
+            try:
+                self._gripper_keyboard_listener.stop()
+            except Exception:
+                pass
+            self._gripper_keyboard_listener = None
+
     def get_action(self) -> dict[str, float]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        self._wait_for_state(require_gripper=self.config.use_gripper)
+        use_keyboard_gripper = getattr(self.config, "gripper_keyboard_enable", False) and self.config.use_gripper
+        self._wait_for_state(require_gripper=self.config.use_gripper and not use_keyboard_gripper)
         joint_positions = self._ordered_joint_positions()
         action = {
             f"{joint}.pos": joint_positions[idx] for idx, joint in enumerate(self.config.joint_names)
         }
 
         if self.config.use_gripper:
-            gripper_width = self._gripper_width()
-            if gripper_width is None:
-                raise RuntimeError("Gripper state is not available")
-            action["gripper.width"] = gripper_width
+            if use_keyboard_gripper:
+                action["gripper.width"] = float(self._gripper_binary_state)
+            else:
+                gripper_width = self._gripper_width()
+                if gripper_width is None:
+                    raise RuntimeError("Gripper state is not available")
+                # self._gripper_binary_state = 0 if gripper_width >= 0.035 else 1 #now I use keyboard to control the gripper
+                action["gripper.width"] = float(self._gripper_binary_state)
 
         return action
 
@@ -227,6 +277,7 @@ class FR3Leader(Teleoperator):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        self._stop_gripper_keyboard_listener()
         if self._executor and self._node:
             self._executor.remove_node(self._node)
             self._executor.shutdown()

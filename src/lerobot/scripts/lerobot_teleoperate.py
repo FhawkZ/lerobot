@@ -104,7 +104,9 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 class TeleoperateConfig:
     # TODO: pepijn, steven: if more robots require multiple teleoperators (like lekiwi) its good to make this possibele in teleop.py and record.py with List[Teleoperator]
     teleop: TeleoperatorConfig
-    robot: RobotConfig
+    robot: RobotConfig | None = None
+    # Allow running only the teleoperator without connecting a robot.
+    enable_robot: bool = True
     # Limit the maximum frames per second.
     fps: int = 60
     teleop_time_s: float | None = None
@@ -120,7 +122,7 @@ class TeleoperateConfig:
 
 def teleop_loop(
     teleop: Teleoperator,
-    robot: Robot,
+    robot: Robot | None,
     fps: int,
     teleop_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
     robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
@@ -146,7 +148,10 @@ def teleop_loop(
         robot_observation_processor: An optional pipeline to process raw observations from the robot.
     """
 
-    display_len = max(len(key) for key in robot.action_features)
+    if robot is None:
+        display_len = 0
+    else:
+        display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
 
     while True:
@@ -156,7 +161,10 @@ def teleop_loop(
         # Not really needed for now other than for visualization
         # teleop_action_processor can take None as an observation
         # given that it is the identity processor as default
-        obs = robot.get_observation()
+        if robot is None:
+            obs = {}
+        else:
+            obs = robot.get_observation()
 
         # Get teleop action
         raw_action = teleop.get_action()
@@ -168,9 +176,10 @@ def teleop_loop(
         robot_action_to_send = robot_action_processor((teleop_action, obs))
 
         # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
-        _ = robot.send_action(robot_action_to_send)
+        if robot is not None:
+            _ = robot.send_action(robot_action_to_send)
 
-        if display_data:
+        if display_data and robot is not None:
             # Process robot observation through pipeline
             obs_transition = robot_observation_processor(obs)
 
@@ -201,6 +210,10 @@ def teleop_loop(
 def teleoperate(cfg: TeleoperateConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
+    if not cfg.enable_robot and cfg.robot is not None:
+        raise ValueError("When enable_robot is False, do not provide robot config.")
+    if cfg.display_data and not cfg.enable_robot:
+        raise ValueError("display_data requires enable_robot=True.")
     if cfg.display_data:
         init_rerun(session_name="teleoperation", ip=cfg.display_ip, port=cfg.display_port)
     display_compressed_images = (
@@ -210,11 +223,12 @@ def teleoperate(cfg: TeleoperateConfig):
     )
 
     teleop = make_teleoperator_from_config(cfg.teleop)
-    robot = make_robot_from_config(cfg.robot)
+    robot = make_robot_from_config(cfg.robot) if cfg.enable_robot else None
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
     teleop.connect()
-    robot.connect()
+    if robot is not None:
+        robot.connect()
 
     try:
         teleop_loop(
@@ -234,7 +248,8 @@ def teleoperate(cfg: TeleoperateConfig):
         if cfg.display_data:
             rr.rerun_shutdown()
         teleop.disconnect()
-        robot.disconnect()
+        if robot is not None:
+            robot.disconnect()
 
 
 def main():

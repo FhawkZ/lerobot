@@ -54,6 +54,7 @@ class FR3Follower(Robot):
         self._gripper_state_msg: Optional[JointState] = None
         self._joint_pub = None
         self._gripper_client: ActionClient | None = None
+        self._gripper_binary_state: int | None = None
 
     @property
     def observation_features(self) -> dict[str, type]:
@@ -105,6 +106,13 @@ class FR3Follower(Robot):
         self._executor.add_node(self._node)
         self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
         self._spin_thread.start()
+
+        if self.config.use_gripper:
+            try:
+                self._send_gripper_command(self.config.gripper_open_width)
+                self._gripper_binary_state = 0
+            except Exception as exc:
+                logger.warning("%s failed to open gripper on connect: %s", self, exc)
 
         self._connected = True
         logger.info(
@@ -220,6 +228,15 @@ class FR3Follower(Robot):
 
         return width * self.config.gripper_width_scale
 
+    def _send_gripper_command(self, width: float) -> None:
+        if self._gripper_client is None:
+            return
+        goal_msg = GripperCommand.Goal()
+        goal_msg.command.position = float(width)
+        goal_msg.command.max_effort = float(self.config.gripper_max_effort)
+        self._gripper_client.wait_for_server()
+        self._gripper_client.send_goal_async(goal_msg)
+
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected")
@@ -271,12 +288,14 @@ class FR3Follower(Robot):
 
         self._joint_pub.publish(traj)
 
-        if self.config.use_gripper and "gripper.width" in action and self._gripper_client is not None:
-            goal_msg = GripperCommand.Goal()
-            goal_msg.command.position = float(action["gripper.width"])
-            goal_msg.command.max_effort = float(self.config.gripper_max_effort)
-            self._gripper_client.wait_for_server()
-            self._gripper_client.send_goal_async(goal_msg)
+        if self.config.use_gripper and "gripper.width" in action:
+            target_state = 1 if float(action["gripper.width"]) >= 0.5 else 0
+            if self._gripper_binary_state != target_state:
+                if target_state == 1:
+                    self._send_gripper_command(self.config.gripper_closed_width)
+                else:
+                    self._send_gripper_command(self.config.gripper_open_width)
+                self._gripper_binary_state = target_state
 
         return action
 

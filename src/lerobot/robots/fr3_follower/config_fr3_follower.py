@@ -41,6 +41,11 @@ class FR3FollowerConfig(RobotConfig):
     )
     use_gripper: bool = True
     gripper_max_effort: float = 20.0
-    gripper_width_scale: float = 1.0
+    gripper_width_scale: float = 0.5
+    # Binary gripper control widths (meters)
+    gripper_open_width: float = 0.04
+    gripper_closed_width: float = 0.0
+    gripper_close_tolerance: float = 0.04
+    gripper_open_tolerance: float = 0.005
     timeout_s: float = 5.0
 
