@@ -17,6 +17,7 @@
 import logging
 import threading
 import time
+from queue import Empty, Queue
 from typing import Any, Optional
 
 import rclpy
@@ -54,6 +55,13 @@ class FR3Follower(Robot):
         self._gripper_state_msg: Optional[JointState] = None
         self._joint_pub = None
         self._gripper_client: ActionClient | None = None
+        self._gripper_grasp_client: ActionClient | None = None
+        self._grasp_action_type = None
+        self._gripper_command_ready = False
+        self._gripper_grasp_ready = False
+        self._gripper_queue: Queue[tuple[str, float]] = Queue(maxsize=1)
+        self._gripper_thread: threading.Thread | None = None
+        self._gripper_stop = threading.Event()
         self._gripper_binary_state: int | None = None
 
     @property
@@ -93,6 +101,18 @@ class FR3Follower(Robot):
             self._gripper_client = ActionClient(
                 self._node, GripperCommand, self.config.gripper_command_topic
             )
+            if self.config.gripper_use_grasp:
+                try:
+                    from franka_gripper.action import Grasp  # type: ignore[import-not-found]
+                except Exception as exc:
+                    logger.warning("Grasp action unavailable, falling back to GripperCommand: %s", exc)
+                    self._grasp_action_type = None
+                    self._gripper_grasp_client = None
+                else:
+                    self._grasp_action_type = Grasp
+                    self._gripper_grasp_client = ActionClient(
+                        self._node, Grasp, self.config.gripper_grasp_topic
+                    )
 
         self._node.create_subscription(
             JointState, self.config.joint_state_topic, self._joint_state_cb, 10
@@ -108,8 +128,19 @@ class FR3Follower(Robot):
         self._spin_thread.start()
 
         if self.config.use_gripper:
+            if self._gripper_client is not None:
+                self._gripper_command_ready = self._gripper_client.wait_for_server(timeout_sec=1.0)
+                if not self._gripper_command_ready:
+                    logger.warning("%s gripper_command action server not ready.", self)
+            if self._gripper_grasp_client is not None:
+                self._gripper_grasp_ready = self._gripper_grasp_client.wait_for_server(timeout_sec=1.0)
+                if not self._gripper_grasp_ready:
+                    logger.warning("%s gripper_grasp action server not ready.", self)
+            self._gripper_stop.clear()
+            self._gripper_thread = threading.Thread(target=self._gripper_loop, daemon=True)
+            self._gripper_thread.start()
             try:
-                self._send_gripper_command(self.config.gripper_open_width)
+                self._enqueue_gripper_goal("command", self.config.gripper_open_width)
                 self._gripper_binary_state = 0
             except Exception as exc:
                 logger.warning("%s failed to open gripper on connect: %s", self, exc)
@@ -229,13 +260,52 @@ class FR3Follower(Robot):
         return width * self.config.gripper_width_scale
 
     def _send_gripper_command(self, width: float) -> None:
-        if self._gripper_client is None:
+        if self._gripper_client is None or not self._gripper_command_ready:
             return
         goal_msg = GripperCommand.Goal()
         goal_msg.command.position = float(width)
         goal_msg.command.max_effort = float(self.config.gripper_max_effort)
-        self._gripper_client.wait_for_server()
         self._gripper_client.send_goal_async(goal_msg)
+
+    def _send_gripper_grasp(self, width: float) -> None:
+        if (
+            self._gripper_grasp_client is None
+            or self._grasp_action_type is None
+            or not self._gripper_grasp_ready
+        ):
+            return
+        goal_msg = self._grasp_action_type.Goal()
+        goal_msg.width = float(width)
+        goal_msg.speed = float(self.config.gripper_grasp_speed)
+        goal_msg.force = float(self.config.gripper_grasp_force)
+        goal_msg.epsilon.inner = float(self.config.gripper_grasp_epsilon_inner)
+        goal_msg.epsilon.outer = float(self.config.gripper_grasp_epsilon_outer)
+        self._gripper_grasp_client.send_goal_async(goal_msg)
+
+    def _enqueue_gripper_goal(self, mode: str, width: float) -> None:
+        try:
+            while True:
+                self._gripper_queue.get_nowait()
+        except Empty:
+            pass
+        try:
+            self._gripper_queue.put_nowait((mode, width))
+        except Exception:
+            pass
+
+    def _gripper_loop(self) -> None:
+        while not self._gripper_stop.is_set():
+            try:
+                mode, width = self._gripper_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                if mode == "grasp":
+                    self._send_gripper_grasp(width)
+                else:
+                    self._send_gripper_command(width)
+            except Exception as exc:
+                logger.warning("%s gripper send failed: %s", self, exc)
 
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
@@ -292,9 +362,12 @@ class FR3Follower(Robot):
             target_state = 1 if float(action["gripper.width"]) >= 0.5 else 0
             if self._gripper_binary_state != target_state:
                 if target_state == 1:
-                    self._send_gripper_command(self.config.gripper_closed_width)
+                    if self.config.gripper_use_grasp:
+                        self._enqueue_gripper_goal("grasp", self.config.gripper_closed_width)
+                    else:
+                        self._enqueue_gripper_goal("command", self.config.gripper_closed_width)
                 else:
-                    self._send_gripper_command(self.config.gripper_open_width)
+                    self._enqueue_gripper_goal("command", self.config.gripper_open_width)
                 self._gripper_binary_state = target_state
 
         return action
@@ -310,6 +383,10 @@ class FR3Follower(Robot):
             self._node.destroy_node()
         if self._owns_rclpy and rclpy.ok():
             rclpy.shutdown()
+        if self._gripper_thread is not None:
+            self._gripper_stop.set()
+            self._gripper_thread.join(timeout=1.0)
+            self._gripper_thread = None
 
         self._connected = False
         self._executor = None

@@ -42,6 +42,12 @@ class FR3FollowerConfig(RobotConfig):
     use_gripper: bool = True
     gripper_max_effort: float = 20.0
     gripper_width_scale: float = 0.5
+    gripper_grasp_topic: str = "/NS_1/franka_gripper/grasp"
+    gripper_use_grasp: bool = True
+    gripper_grasp_force: float = 10.0
+    gripper_grasp_speed: float = 0.1
+    gripper_grasp_epsilon_inner: float = 0.04
+    gripper_grasp_epsilon_outer: float = 0.04
     # Binary gripper control widths (meters)
     gripper_open_width: float = 0.04
     gripper_closed_width: float = 0.0
