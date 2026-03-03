@@ -32,6 +32,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_so_follower,
     fr3_follower,
+    fr3_linker_l6_follower,
     koch_follower,
     lekiwi,
     make_robot_from_config,
@@ -60,6 +61,8 @@ COMPATIBLE_DEVICES = [
     "lekiwi",
     "fr3_follower",
     "fr3_leader",
+    "fr3_linker_l6_follower",
+    "mocap_leader",
 ]
 
 

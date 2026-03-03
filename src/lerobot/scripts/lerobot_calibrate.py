@@ -38,6 +38,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_so_follower,
     fr3_follower,
+    fr3_linker_l6_follower,
     hope_jr,
     koch_follower,
     lekiwi,
@@ -53,6 +54,7 @@ from lerobot.teleoperators import (  # noqa: F401
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
+    mocap_leader,
     omx_leader,
     so_leader,
 )

@@ -44,6 +44,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .fr3_follower import FR3Follower
 
         return FR3Follower(config)
+    elif config.type == "fr3_linker_l6_follower":
+        from .fr3_linker_l6_follower import FR3LinkerL6Follower
+
+        return FR3LinkerL6Follower(config)
     elif config.type == "lekiwi":
         from .lekiwi import LeKiwi
 
