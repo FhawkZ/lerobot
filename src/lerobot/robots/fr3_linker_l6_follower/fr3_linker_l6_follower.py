@@ -171,6 +171,8 @@ class FR3LinkerL6Follower(Robot):
         arm_vel = _ordered_values(arm_msg, self.config.arm_joint_names, "velocity")
         arm_eff = _ordered_values(arm_msg, self.config.arm_joint_names, "effort")
         hand_pos = _ordered_values(hand_msg, self.config.hand_joint_names, "position")
+        hand_vel = _ordered_values(hand_msg, self.config.hand_joint_names, "velocity")
+        hand_eff = _ordered_values(hand_msg, self.config.hand_joint_names, "effort")
 
         obs = {}
         for i, j in enumerate(self.config.arm_joint_names):
@@ -179,11 +181,14 @@ class FR3LinkerL6Follower(Robot):
             obs[f"{j}.torque"] = arm_eff[i]
         for i, j in enumerate(self.config.hand_joint_names):
             obs[f"{j}.pos"] = hand_pos[i]
+            obs[f"{j}.vel"] = hand_vel[i]
+            obs[f"{j}.torque"] = hand_eff[i]
         return obs
 
     def _hand_to_linker_range(self, val: float) -> float:
-        out = val * self.config.hand_position_scale + self.config.hand_position_offset
-        return max(0.0, min(255.0, round(out, 2)))
+        # mocap_to_linkerhand outputs LinkerHand L6 commands directly in [0, 255].
+        # Keep the robot side consistent by treating the incoming action as u8 values.
+        return max(0.0, min(255.0, round(float(val), 2)))
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:

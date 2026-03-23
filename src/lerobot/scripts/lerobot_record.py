@@ -199,15 +199,6 @@ class RecordConfig:
     policy: PreTrainedConfig | None = None
     # Display all cameras on screen
     display_data: bool = False
-    # Display data on a remote Rerun server
-    display_ip: str | None = None
-    # Port of the remote Rerun server
-    display_port: int | None = None
-    # Whether to  display compressed images in Rerun
-    display_compressed_images: bool = False
-    # Use vocal synthesis to read events.
-    play_sounds: bool = True
-    # Resume recording on an existing dataset.
     resume: bool = False
 
     def __post_init__(self):
@@ -316,6 +307,16 @@ def record_loop(
         policy.reset()
         preprocessor.reset()
         postprocessor.reset()
+
+    # Reset MocapLeader incremental pose so first frame has zero delta (avoids large
+    # displacement when hand position differs from previous loop)
+    if teleop is not None and hasattr(teleop, "reset_incremental_pose"):
+        teleop.reset_incremental_pose()
+    elif isinstance(teleop, list):
+        for t in teleop:
+            if hasattr(t, "reset_incremental_pose"):
+                t.reset_incremental_pose()
+                break
 
     timestamp = 0
     start_episode_t = time.perf_counter()

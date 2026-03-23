@@ -24,7 +24,10 @@ from ..config import TeleoperatorConfig
 class MocapLeaderConfig(TeleoperatorConfig):
     """Configuration for MocapLeader (PNstudio motion capture)."""
 
+    # Optional: legacy JointState topic from mocap_to_robot_ros2 (not used by new IK path)
     joint_state_topic: str = "/joint_states"
+
+    # FR3 arm joint names (must match FR3LinkerL6Follower.arm_joint_names)
     arm_joint_names: list[str] = field(
         default_factory=lambda: [
             "fr3_joint1",
@@ -36,6 +39,8 @@ class MocapLeaderConfig(TeleoperatorConfig):
             "fr3_joint7",
         ]
     )
+
+    # Linker L6 hand joint names (must match FR3LinkerL6Follower.hand_joint_names order)
     hand_joint_names: list[str] = field(
         default_factory=lambda: [
             "hand_0",
@@ -46,4 +51,17 @@ class MocapLeaderConfig(TeleoperatorConfig):
             "hand_5",
         ]
     )
+
+    # Path to FR3 URDF used for IK (if empty, defaults to local fr3.urdf next to mocap_leader.py)
+    fr3_urdf_path: str = ""
+    # Name of the FR3 end-effector link in the URDF
+    fr3_ee_frame_name: str = "fr3_link8"
+
+    # FR3 joint state topic for FK (current EE pose). Used for incremental control.
+    fr3_joint_state_topic: str = "/NS_1/franka_robot_state_broadcaster/measured_joint_states"
+
+    # Timeout waiting for mocap / joint state messages
     timeout_s: float = 5.0
+
+    # Mocap background poll frequency (Hz), same as mocap_to_linkerhand MocapReader
+    mocap_poll_hz: float = 120.0
