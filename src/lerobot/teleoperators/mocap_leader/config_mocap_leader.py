@@ -58,7 +58,9 @@ class MocapLeaderConfig(TeleoperatorConfig):
     fr3_ee_frame_name: str = "fr3_link8"
 
     # FR3 joint state topic for FK (current EE pose). Used for incremental control.
-    fr3_joint_state_topic: str = "/NS_1/franka_robot_state_broadcaster/measured_joint_states"
+    # Keep aligned with follower default to avoid dependence on
+    # franka_robot_state_broadcaster realtime publisher stability.
+    fr3_joint_state_topic: str = "/NS_1/joint_states"
 
     # Optional axis alignment from mocap frame to FR3 frame.
     # When enabled, apply:

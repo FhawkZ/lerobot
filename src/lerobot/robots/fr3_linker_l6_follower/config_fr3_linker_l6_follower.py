@@ -24,11 +24,13 @@ from ..config import RobotConfig
 class FR3LinkerL6FollowerConfig(RobotConfig):
     """Configuration for FR3 arm + Linker L6 hand follower (ROS2)."""
 
-    # For JointGroupPositionController, commands are streamed as Float64MultiArray.
-    joint_command_topic: str = "/NS_1/joint_group_position_controller/commands"
+    # Use FollowJointTrajectory style arm command, consistent with fr3_follower.
+    joint_command_topic: str = "/NS_1/fr3_arm_controller/joint_trajectory"
+    # Keep arm feedback aligned with fr3_follower measured states.
     joint_state_topic: str = "/NS_1/franka_robot_state_broadcaster/measured_joint_states"
     hand_control_topic: str = "/cb_right_hand_control_cmd"
     hand_state_topic: str = "/cb_right_hand_state"
+    enable_arm_publish: bool = True
     arm_joint_names: list[str] = field(
         default_factory=lambda: [
             "fr3_joint1",

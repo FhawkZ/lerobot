@@ -15,14 +15,16 @@
 # limitations under the License.
 
 import logging
+import math
 import threading
 import time
 from typing import Any, Optional
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
@@ -70,11 +72,36 @@ class FR3LinkerL6Follower(Robot):
         # ================= 🟢 核心保险层：变量初始化 =================
         # 用于 EMA 低通滤波的状态记忆
         self._ema_arm_pos: Optional[list[float]] = None
-        # 平滑系数 (0~1)。越小动作越柔顺，但“跟手”延迟会略微变大；建议在 0.2 ~ 0.5 之间调节。
-        self._alpha = 0.3  
-        # 安全截断：在 30Hz 频率下，限制单步的最大移动量（弧度），防止 Franka 底层抱闸。
-        # 0.05 弧度/步 ≈ 1.5 rad/s 的速度，对遥操作非常安全。
-        self._max_dq_per_step = 0.05  
+        # 平滑系数 (0~1)。适当减小可显著降低关节速度/加速度不连续风险。
+        self._alpha = 0.2
+        # 安全截断：限制单步最大变化量（弧度），抑制突变触发 Franka reflex。
+        # 在 60Hz 下，0.01 rad/step ≈ 0.6 rad/s。
+        self._max_dq_per_step = 0.02
+        # 以“上一次已发送命令”为基准再做一次硬限幅，避免状态抖动导致突变。
+        self._last_cmd_arm_pos: Optional[list[float]] = None
+        self._last_cmd_step: Optional[list[float]] = None
+        # 限制每一帧“步长变化”，等效限制加速度突变。
+        self._max_ddq_per_step = 0.002
+        # 连续多帧观测到大跳变再重置 EMA，避免单帧噪声触发反复重置。
+        self._jump_count = 0
+        self._jump_reset_threshold = 10
+        self._cmd_debug_counter = 0
+        self._startup_hold_s = 0.5
+        self._publish_min_interval_s = 1.0 / 30.0  # 30 Hz
+        self._traj_time_from_start_s = 0.08
+        self._connect_monotonic_s: Optional[float] = None
+        self._last_publish_monotonic_s: Optional[float] = None
+        self._logged_startup_hold = False
+        self._last_measured_arm_pos: Optional[list[float]] = None
+        self._motion_gate_threshold_rad = 0.0
+        self._max_cmd_to_meas_rad = 0.02
+        self._arm_publish_locked = True
+        self._unlock_motion_threshold_rad = 0.004
+        self._unlock_consecutive_frames = 2
+        self._unlock_counter = 0
+        self._lock_debug_counter = 0
+        self._unlock_blend = 0.0
+        self._unlock_blend_step = 0.1  # ~1s to fully open at 10Hz
         # ==========================================================
 
     @property
@@ -110,7 +137,7 @@ class FR3LinkerL6Follower(Robot):
         self._node = rclpy.create_node(node_name)
 
         self._arm_pub = self._node.create_publisher(
-            Float64MultiArray, self.config.joint_command_topic, 10
+            JointTrajectory, self.config.joint_command_topic, 10
         )
         self._hand_pub = self._node.create_publisher(
             JointState, self.config.hand_control_topic, 10
@@ -128,11 +155,23 @@ class FR3LinkerL6Follower(Robot):
         self._spin_thread.start()
 
         self._connected = True
+        self._connect_monotonic_s = time.monotonic()
+        self._last_publish_monotonic_s = None
+        self._logged_startup_hold = False
+        self._arm_publish_locked = True
+        self._unlock_counter = 0
+        self._lock_debug_counter = 0
+        self._unlock_blend = 0.0
         logger.info(
-            "%s connected (arm_cmd=%s, hand_cmd=%s)",
+            "%s connected (arm_cmd=%s, hand_cmd=%s, arm_publish=%s, hold_s=%.2f, publish_hz=%.1f, traj_t=%.2f, arm_locked=%s)",
             self,
             self.config.joint_command_topic,
             self.config.hand_control_topic,
+            self.config.enable_arm_publish,
+            self._startup_hold_s,
+            1.0 / self._publish_min_interval_s,
+            self._traj_time_from_start_s,
+            self._arm_publish_locked,
         )
 
     @property
@@ -205,50 +244,94 @@ class FR3LinkerL6Follower(Robot):
             key = f"{j}.pos"
             if key not in action:
                 raise ValueError(f"Missing action key: {key}")
-            raw_arm_pos.append(float(action[key]))
+            value = float(action[key])
+            if not math.isfinite(value):
+                logger.warning("Received non-finite action for %s, ignoring this frame.", key)
+                return action
+            raw_arm_pos.append(value)
+
+        if not self.config.enable_arm_publish:
+            hand_pos = []
+            for j in self.config.hand_joint_names:
+                key = f"{j}.pos"
+                if key not in action:
+                    raise ValueError(f"Missing action key: {key}")
+                hand_pos.append(float(action[key]))
+            hand_msg = JointState()
+            hand_msg.header.stamp = self._node.get_clock().now().to_msg()
+            hand_msg.name = list(self.config.hand_joint_names)
+            hand_msg.position = hand_pos
+            self._hand_pub.publish(hand_msg)
+            return action
 
         with self._lock:
             current_arm_msg = self._arm_state_msg
 
         if current_arm_msg is None:
-            logger.warning("No joint state received yet. Sending raw action.")
-            safe_arm_pos = raw_arm_pos
+            logger.warning("No joint state received yet. Skip this arm command frame.")
+            return action
         else:
             current_pos = _ordered_values(current_arm_msg, self.config.arm_joint_names, "position")
+            self._last_measured_arm_pos = current_pos.copy()
+            # Remove follower-side suppression: pass leader target through directly.
+            safe_arm_pos = raw_arm_pos.copy()
 
-            # If physical arm has been manually reset between episodes, clear stale EMA state.
-            if self._ema_arm_pos is not None:
-                max_diff = max(
-                    abs(self._ema_arm_pos[i] - current_pos[i])
-                    for i in range(len(current_pos))
+        now_s = time.monotonic()
+        dt_since_connect = (
+            now_s - self._connect_monotonic_s if self._connect_monotonic_s is not None else None
+        )
+        if dt_since_connect is not None and dt_since_connect < self._startup_hold_s:
+            # Startup protection: keep command pinned to measured pose for a short period.
+            safe_arm_pos = current_pos.copy()
+            self._ema_arm_pos = current_pos.copy()
+            self._last_cmd_step = [0.0] * len(safe_arm_pos)
+            self._last_cmd_arm_pos = safe_arm_pos.copy()
+            if not self._logged_startup_hold:
+                logger.warning(
+                    "FR3 startup hold enabled for %.2fs: publishing measured joints only.",
+                    self._startup_hold_s,
                 )
-                if max_diff > 0.5:
-                    logger.info(
-                        "Large joint jump detected (episode reset). Resetting follower EMA state."
-                    )
-                    self._ema_arm_pos = None
+                self._logged_startup_hold = True
+        else:
+            self._arm_publish_locked = False
 
-            if self._ema_arm_pos is None:
-                self._ema_arm_pos = current_pos.copy()
+        if self._last_publish_monotonic_s is not None:
+            dt_pub = now_s - self._last_publish_monotonic_s
+            if dt_pub < self._publish_min_interval_s:
+                return action
 
-            safe_arm_pos = []
-            for i in range(len(raw_arm_pos)):
-                # Filter command stream itself, decoupled from measured position.
-                smoothed_target = self._alpha * raw_arm_pos[i] + (1.0 - self._alpha) * self._ema_arm_pos[i]
-                cmd_step = smoothed_target - self._ema_arm_pos[i]
-
-                if cmd_step > self._max_dq_per_step:
-                    cmd_step = self._max_dq_per_step
-                elif cmd_step < -self._max_dq_per_step:
-                    cmd_step = -self._max_dq_per_step
-
-                safe_val = self._ema_arm_pos[i] + cmd_step
-                safe_arm_pos.append(safe_val)
-                self._ema_arm_pos[i] = safe_val
-
-        arm_msg = Float64MultiArray()
-        arm_msg.data = safe_arm_pos
+        arm_msg = JointTrajectory()
+        arm_msg.header.stamp = self._node.get_clock().now().to_msg()
+        arm_msg.joint_names = list(self.config.arm_joint_names)
+        point = JointTrajectoryPoint()
+        point.positions = safe_arm_pos
+        point.time_from_start = Duration(seconds=self._traj_time_from_start_s).to_msg()
+        arm_msg.points = [point]
         self._arm_pub.publish(arm_msg)
+        self._last_publish_monotonic_s = now_s
+        if self._last_cmd_arm_pos is None:
+            self._last_cmd_step = [0.0] * len(safe_arm_pos)
+        else:
+            self._last_cmd_step = [
+                safe_arm_pos[i] - self._last_cmd_arm_pos[i] for i in range(len(safe_arm_pos))
+            ]
+        self._last_cmd_arm_pos = safe_arm_pos.copy()
+        self._cmd_debug_counter += 1
+        if self._cmd_debug_counter % 20 == 0:
+            max_raw_to_meas = max(abs(raw_arm_pos[i] - current_pos[i]) for i in range(len(raw_arm_pos)))
+            max_cmd_to_meas = max(abs(safe_arm_pos[i] - current_pos[i]) for i in range(len(raw_arm_pos)))
+            max_cmd_step = (
+                max(abs(v) for v in self._last_cmd_step) if self._last_cmd_step is not None else 0.0
+            )
+            logger.info(
+                "Send FR3 cmd(rad)=%s (raw=%s) max|raw-meas|=%.5f max|cmd-meas|=%.5f max|cmd_step|=%.5f dt_connect=%.3f",
+                [round(v, 4) for v in safe_arm_pos],
+                [round(v, 4) for v in raw_arm_pos],
+                max_raw_to_meas,
+                max_cmd_to_meas,
+                max_cmd_step,
+                -1.0 if dt_since_connect is None else dt_since_connect,
+            )
 
         # 4. 手爪控制逻辑：直接透传 action 值
         hand_pos = []

@@ -419,11 +419,21 @@ class MocapLeader(Teleoperator):
         self._last_q_deg = np.zeros(self._pin_model.nv, dtype=np.float64)
         self._ik_damp = 1e-6
         self._ik_tol = 1e-4
-        self._ik_max_step_norm = 0.08
+        # "Clearly movable" preset: increase per-cycle IK/joint delta limits.
+        self._ik_max_step_norm = 0.25
         self._ik_enable_limit_avoidance = True
         self._ik_limit_threshold = 0.15
         self._ik_limit_gain = 2.0
         self._virtual_q: Optional[np.ndarray] = None
+        self._max_joint_step_per_cycle = 0.04  # rad
+        self._max_delta_pos_per_cycle = 0.04  # m
+        self._max_delta_rot_per_cycle = 0.30  # rad
+        # Motion scaling + smoothing for clearer movement and less translation jitter.
+        self._delta_pos_gain = 1.8
+        self._delta_rot_gain = 1.4
+        self._delta_lpf_alpha = 0.7
+        self._filtered_delta_x: Optional[np.ndarray] = None
+        self._debug_counter = 0
 
         self._finger_tip_links: list[str] = [
             "RightHandThumb3",
@@ -707,6 +717,7 @@ class MocapLeader(Teleoperator):
         """Reset incremental state to avoid first-frame jumps across episode boundaries."""
         with self._lock:
             self._virtual_q = None
+            self._filtered_delta_x = None
             if self._latest_arm_pose is not None:
                 hand_pos, hand_quat = self._latest_arm_pose
                 self._prev_hand_pose = (
@@ -745,8 +756,7 @@ class MocapLeader(Teleoperator):
             hand_pos, hand_quat = self._latest_arm_pose
 
         arm_pos_rad = self._ordered_arm_positions_rad()
-        if self._virtual_q is None:
-            self._virtual_q = np.array(arm_pos_rad, dtype=np.float64)
+        q_curr = np.array(arm_pos_rad, dtype=np.float64)
 
         if self._prev_hand_pose is None:
             delta_pos = (0.0, 0.0, 0.0)
@@ -783,10 +793,44 @@ class MocapLeader(Teleoperator):
         else:
             delta_x = np.hstack([delta_pos_arr, delta_rotvec])
 
-        delta_q = self._compute_incremental_ik(q_curr=self._virtual_q, delta_x=delta_x)
-        self._virtual_q += delta_q
-        q_next = self._virtual_q
+        # Scale mocap deltas to better match human hand motion magnitude.
+        delta_x[:3] *= self._delta_pos_gain
+        delta_x[3:] *= self._delta_rot_gain
+
+        # Low-pass delta stream to reduce jitter/stutter in translation.
+        if self._filtered_delta_x is None:
+            self._filtered_delta_x = delta_x.copy()
+        else:
+            self._filtered_delta_x = (
+                self._delta_lpf_alpha * delta_x
+                + (1.0 - self._delta_lpf_alpha) * self._filtered_delta_x
+            )
+        delta_x = self._filtered_delta_x.copy()
+
+        # Clamp mocap glitches to keep the robot command stream continuous.
+        delta_pos_norm = float(np.linalg.norm(delta_x[:3]))
+        if delta_pos_norm > self._max_delta_pos_per_cycle and delta_pos_norm > 1e-12:
+            delta_x[:3] *= self._max_delta_pos_per_cycle / delta_pos_norm
+        delta_rot_norm = float(np.linalg.norm(delta_x[3:]))
+        if delta_rot_norm > self._max_delta_rot_per_cycle and delta_rot_norm > 1e-12:
+            delta_x[3:] *= self._max_delta_rot_per_cycle / delta_rot_norm
+
+        delta_q = self._compute_incremental_ik(q_curr=q_curr, delta_x=delta_x)
+        delta_q = np.clip(
+            delta_q,
+            -self._max_joint_step_per_cycle,
+            self._max_joint_step_per_cycle,
+        )
+        q_next = q_curr + delta_q
         self._last_q_deg = np.rad2deg(q_next)
+        self._debug_counter += 1
+        if self._debug_counter % 30 == 0:
+            logger.info(
+                "Mocap->FR3 delta pos=%.4f m rot=%.4f rad q(rad)=%s",
+                float(np.linalg.norm(delta_x[:3])),
+                float(np.linalg.norm(delta_x[3:])),
+                [round(float(v), 4) for v in q_next[: len(self.config.arm_joint_names)]],
+            )
         return [float(v) for v in q_next[: len(self.config.arm_joint_names)]]
 
     def _compute_hand_joints(self) -> list[float]:
