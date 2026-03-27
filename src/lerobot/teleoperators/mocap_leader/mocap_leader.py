@@ -28,13 +28,16 @@ import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from sensor_msgs.msg import JointState
 
-from lerobot.model.kinematics import RobotKinematics
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..teleoperator import Teleoperator
 from .config_mocap_leader import MocapLeaderConfig
 
 logger = logging.getLogger(__name__)
+try:
+    import pinocchio as pin
+except ImportError:
+    pin = None  # type: ignore[assignment]
 
 try:
     from lerobot.third_party.mocap_ros_py.mocap_robotapi import (
@@ -405,12 +408,22 @@ class MocapLeader(Teleoperator):
             urdf_path = self.config.fr3_urdf_path
         else:
             urdf_path = str(Path(__file__).with_name("fr3.urdf"))
-        self._ik = RobotKinematics(
-            urdf_path=urdf_path,
-            target_frame_name=self.config.fr3_ee_frame_name,
-            joint_names=list(self.config.arm_joint_names),
-        )
-        self._last_q_deg = np.zeros(len(self.config.arm_joint_names), dtype=np.float64)
+        if pin is None:
+            raise ImportError(
+                "pinocchio is required for MocapLeader incremental IK. "
+                "Please install pinocchio in the current environment."
+            )
+        self._pin_model = self._build_arm_only_model(urdf_path)
+        self._pin_data = self._pin_model.createData()
+        self._pin_frame_id = self._choose_frame_id(self.config.fr3_ee_frame_name)
+        self._last_q_deg = np.zeros(self._pin_model.nv, dtype=np.float64)
+        self._ik_damp = 1e-6
+        self._ik_tol = 1e-4
+        self._ik_max_step_norm = 0.08
+        self._ik_enable_limit_avoidance = True
+        self._ik_limit_threshold = 0.15
+        self._ik_limit_gain = 2.0
+        self._virtual_q: Optional[np.ndarray] = None
 
         self._finger_tip_links: list[str] = [
             "RightHandThumb3",
@@ -596,10 +609,104 @@ class MocapLeader(Teleoperator):
             raise ValueError("FR3 JointState has fewer positions than arm joints")
         return [float(msg.position[i]) for i in range(len(self.config.arm_joint_names))]
 
+    def _build_arm_only_model(self, urdf_path: str):
+        assert pin is not None
+        full_model = pin.buildModelFromUrdf(urdf_path)
+        joint_names_to_lock = {"fr3_finger_joint1", "fr3_finger_joint2"}
+        joints_to_lock = []
+        for joint_name in joint_names_to_lock:
+            if full_model.existJointName(joint_name):
+                joints_to_lock.append(full_model.getJointId(joint_name))
+        if not joints_to_lock:
+            return full_model
+        q_ref = pin.neutral(full_model)
+        return pin.buildReducedModel(full_model, joints_to_lock, q_ref)
+
+    def _choose_frame_id(self, preferred_frame: str) -> int:
+        assert pin is not None
+        if self._pin_model.existFrame(preferred_frame):
+            return self._pin_model.getFrameId(preferred_frame)
+        for frame_name in ["fr3_link8", "fr3_hand", "fr3_hand_tcp"]:
+            if self._pin_model.existFrame(frame_name):
+                return self._pin_model.getFrameId(frame_name)
+        return self._pin_model.nframes - 1
+
+    def _compute_incremental_ik(self, q_curr: np.ndarray, delta_x: np.ndarray) -> np.ndarray:
+        assert pin is not None
+        model = self._pin_model
+        data = self._pin_data
+        frame_id = self._pin_frame_id
+        t0 = time.perf_counter()
+        q = q_curr.copy()
+        q_min = model.lowerPositionLimit
+        q_max = model.upperPositionLimit
+
+        # 目标定义：在当前位姿上叠加 delta_x
+        pin.forwardKinematics(model, data, q)
+        pin.updateFramePlacements(model, data)
+        o_m_f0 = data.oMf[frame_id]
+        target_t = o_m_f0.translation + delta_x[:3]
+        target_r = pin.exp3(delta_x[3:]) @ o_m_f0.rotation
+
+        jacobian = pin.computeFrameJacobian(
+            model, data, q, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+        )
+        jj_t = jacobian @ jacobian.T
+        h_damped = jj_t + self._ik_damp * np.eye(6)
+        h_inv = np.linalg.solve(h_damped, np.eye(6))
+        j_pinv = jacobian.T @ h_inv
+        delta_q_task = j_pinv @ delta_x
+
+        delta_q = delta_q_task
+
+        if self._ik_enable_limit_avoidance:
+            v_redundant = np.zeros(model.nv)
+            for j in range(model.nv):
+                dist_to_lower = q[j] - q_min[j]
+                dist_to_upper = q_max[j] - q[j]
+                if dist_to_lower < self._ik_limit_threshold:
+                    v_redundant[j] = self._ik_limit_gain * (
+                        self._ik_limit_threshold - dist_to_lower
+                    ) ** 2
+                elif dist_to_upper < self._ik_limit_threshold:
+                    v_redundant[j] = -self._ik_limit_gain * (
+                        self._ik_limit_threshold - dist_to_upper
+                    ) ** 2
+            p_null = np.eye(model.nv) - j_pinv @ jacobian
+            delta_q += p_null @ v_redundant
+
+        step_norm = float(np.linalg.norm(delta_q))
+        if step_norm > self._ik_max_step_norm and step_norm > 1e-12:
+            delta_q *= self._ik_max_step_norm / step_norm
+
+        q_next = np.clip(q + delta_q, q_min, q_max)
+
+        # 后验误差统计（对齐 fr3_incremental_ik.py）
+        pos_err0 = target_t - o_m_f0.translation
+        rot_err0 = pin.log3(target_r @ o_m_f0.rotation.T)
+        initial_err_norm = float(np.linalg.norm(np.hstack([pos_err0, rot_err0])))
+
+        pin.forwardKinematics(model, data, q_next)
+        pin.updateFramePlacements(model, data)
+        o_m_f1 = data.oMf[frame_id]
+        pos_err1 = target_t - o_m_f1.translation
+        rot_err1 = pin.log3(target_r @ o_m_f1.rotation.T)
+        final_err_norm = float(np.linalg.norm(np.hstack([pos_err1, rot_err1])))
+        if final_err_norm > self._ik_tol:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            logger.debug(
+                "Incremental IK residual final=%.6f initial=%.6f elapsed_ms=%.3f",
+                final_err_norm,
+                initial_err_norm,
+                elapsed_ms,
+            )
+
+        return q_next - q_curr
+
     def reset_incremental_pose(self) -> None:
-        """Reset _prev_hand_pose to current hand pose. Call at record-loop start to avoid
-        large delta on first frame after loop transitions (episode/reset boundaries)."""
+        """Reset incremental state to avoid first-frame jumps across episode boundaries."""
         with self._lock:
+            self._virtual_q = None
             if self._latest_arm_pose is not None:
                 hand_pos, hand_quat = self._latest_arm_pose
                 self._prev_hand_pose = (
@@ -637,13 +744,10 @@ class MocapLeader(Teleoperator):
             assert self._latest_arm_pose is not None
             hand_pos, hand_quat = self._latest_arm_pose
 
-        # Get current FR3 joint positions (radians) and compute current EE pose via FK
         arm_pos_rad = self._ordered_arm_positions_rad()
-        arm_pos_deg = np.rad2deg(arm_pos_rad)
-        q_deg = np.array(arm_pos_deg, dtype=np.float64)
-        T_ee_current = self._ik.forward_kinematics(q_deg)
+        if self._virtual_q is None:
+            self._virtual_q = np.array(arm_pos_rad, dtype=np.float64)
 
-        # Compute hand motion delta (current - previous)
         if self._prev_hand_pose is None:
             delta_pos = (0.0, 0.0, 0.0)
             delta_quat = (0.0, 0.0, 0.0, 1.0)
@@ -659,25 +763,31 @@ class MocapLeader(Teleoperator):
         with self._lock:
             self._prev_hand_pose = (hand_pos, hand_quat)
 
-        # Apply delta to current EE pose: target = current + delta
-        current_pos = T_ee_current[:3, 3].copy()
-        current_R = T_ee_current[:3, :3].copy()
-        delta_R = pose_to_mat((0.0, 0.0, 0.0), delta_quat)[:3, :3]
-        target_pos = current_pos + np.array(delta_pos, dtype=np.float64)
-        target_R = delta_R @ current_R
-        T_target = np.eye(4, dtype=np.float64)
-        T_target[:3, :3] = target_R
-        T_target[:3, 3] = target_pos
+        delta_rotvec = Rotation.from_quat(np.array(delta_quat, dtype=np.float64)).as_rotvec()
+        delta_pos_arr = np.array(delta_pos, dtype=np.float64)
 
-        q_deg = self._ik.inverse_kinematics(
-            current_joint_pos=q_deg,
-            desired_ee_pose=T_target,
-            position_weight=1.0,
-            orientation_weight=0.1,
-        )
-        self._last_q_deg = q_deg
-        q_rad = np.deg2rad(q_deg[: len(self.config.arm_joint_names)])
-        return [float(v) for v in q_rad]
+        if self.config.enable_mocap_to_fr3_axis_mapping:
+            # Mapping:
+            #   X_robot = Y_mocap
+            #   Y_robot = -X_mocap
+            #   Z_robot = Z_mocap
+            aligned_delta_pos = np.array(
+                [delta_pos_arr[1], -delta_pos_arr[0], delta_pos_arr[2]],
+                dtype=np.float64,
+            )
+            aligned_delta_rotvec = np.array(
+                [delta_rotvec[1], -delta_rotvec[0], delta_rotvec[2]],
+                dtype=np.float64,
+            )
+            delta_x = np.hstack([aligned_delta_pos, aligned_delta_rotvec])
+        else:
+            delta_x = np.hstack([delta_pos_arr, delta_rotvec])
+
+        delta_q = self._compute_incremental_ik(q_curr=self._virtual_q, delta_x=delta_x)
+        self._virtual_q += delta_q
+        q_next = self._virtual_q
+        self._last_q_deg = np.rad2deg(q_next)
+        return [float(v) for v in q_next[: len(self.config.arm_joint_names)]]
 
     def _compute_hand_joints(self) -> list[float]:
         with self._lock:

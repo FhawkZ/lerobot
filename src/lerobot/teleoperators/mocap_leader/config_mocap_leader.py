@@ -60,6 +60,12 @@ class MocapLeaderConfig(TeleoperatorConfig):
     # FR3 joint state topic for FK (current EE pose). Used for incremental control.
     fr3_joint_state_topic: str = "/NS_1/franka_robot_state_broadcaster/measured_joint_states"
 
+    # Optional axis alignment from mocap frame to FR3 frame.
+    # When enabled, apply:
+    #   X_robot = Y_mocap, Y_robot = -X_mocap, Z_robot = Z_mocap
+    # to both translation delta and rotation-vector delta before IK.
+    enable_mocap_to_fr3_axis_mapping: bool = False
+
     # Timeout waiting for mocap / joint state messages
     timeout_s: float = 5.0
 

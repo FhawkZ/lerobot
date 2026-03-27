@@ -24,7 +24,8 @@ from ..config import RobotConfig
 class FR3LinkerL6FollowerConfig(RobotConfig):
     """Configuration for FR3 arm + Linker L6 hand follower (ROS2)."""
 
-    joint_command_topic: str = "/NS_1/fr3_arm_controller/joint_trajectory"
+    # For JointGroupPositionController, commands are streamed as Float64MultiArray.
+    joint_command_topic: str = "/NS_1/joint_group_position_controller/commands"
     joint_state_topic: str = "/NS_1/franka_robot_state_broadcaster/measured_joint_states"
     hand_control_topic: str = "/cb_right_hand_control_cmd"
     hand_state_topic: str = "/cb_right_hand_state"
@@ -49,7 +50,4 @@ class FR3LinkerL6FollowerConfig(RobotConfig):
             "hand_5",
         ]
     )
-    # Linker L6 uses 0-255 command range. Scale/offset to convert from action space (e.g. rad or 0-1) to 0-255.
-    hand_position_scale: float = 40.5845  # 255 / (2 * pi) for rad -> [0,255]
-    hand_position_offset: float = 127.5
     timeout_s: float = 5.0

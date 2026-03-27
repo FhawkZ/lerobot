@@ -20,10 +20,9 @@ import time
 from typing import Any, Optional
 
 import rclpy
-from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from std_msgs.msg import Float64MultiArray
 
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
@@ -68,13 +67,23 @@ class FR3LinkerL6Follower(Robot):
         self._arm_pub = None
         self._hand_pub = None
 
+        # ================= 🟢 核心保险层：变量初始化 =================
+        # 用于 EMA 低通滤波的状态记忆
+        self._ema_arm_pos: Optional[list[float]] = None
+        # 平滑系数 (0~1)。越小动作越柔顺，但“跟手”延迟会略微变大；建议在 0.2 ~ 0.5 之间调节。
+        self._alpha = 0.3  
+        # 安全截断：在 30Hz 频率下，限制单步的最大移动量（弧度），防止 Franka 底层抱闸。
+        # 0.05 弧度/步 ≈ 1.5 rad/s 的速度，对遥操作非常安全。
+        self._max_dq_per_step = 0.05  
+        # ==========================================================
+
     @property
     def observation_features(self) -> dict[str, type]:
         features = {}
         for j in self.config.arm_joint_names:
             features[f"{j}.pos"] = float
-            features[f"{j}.vel"] = float
-            features[f"{j}.torque"] = float
+            # features[f"{j}.vel"] = float
+            # features[f"{j}.torque"] = float
         for j in self.config.hand_joint_names:
             features[f"{j}.pos"] = float
         return features
@@ -101,7 +110,7 @@ class FR3LinkerL6Follower(Robot):
         self._node = rclpy.create_node(node_name)
 
         self._arm_pub = self._node.create_publisher(
-            JointTrajectory, self.config.joint_command_topic, 10
+            Float64MultiArray, self.config.joint_command_topic, 10
         )
         self._hand_pub = self._node.create_publisher(
             JointState, self.config.hand_control_topic, 10
@@ -168,54 +177,86 @@ class FR3LinkerL6Follower(Robot):
             raise RuntimeError("Arm or hand state not available")
 
         arm_pos = _ordered_values(arm_msg, self.config.arm_joint_names, "position")
-        arm_vel = _ordered_values(arm_msg, self.config.arm_joint_names, "velocity")
-        arm_eff = _ordered_values(arm_msg, self.config.arm_joint_names, "effort")
+        # arm_vel = _ordered_values(arm_msg, self.config.arm_joint_names, "velocity")
+        # arm_eff = _ordered_values(arm_msg, self.config.arm_joint_names, "effort")
         hand_pos = _ordered_values(hand_msg, self.config.hand_joint_names, "position")
-        hand_vel = _ordered_values(hand_msg, self.config.hand_joint_names, "velocity")
-        hand_eff = _ordered_values(hand_msg, self.config.hand_joint_names, "effort")
+        # Keep observation fields aligned with `observation_features`:
+        # only hand position is exposed for now.
+        # hand_vel = _ordered_values(hand_msg, self.config.hand_joint_names, "velocity")
+        # hand_eff = _ordered_values(hand_msg, self.config.hand_joint_names, "effort")
 
         obs = {}
         for i, j in enumerate(self.config.arm_joint_names):
             obs[f"{j}.pos"] = arm_pos[i]
-            obs[f"{j}.vel"] = arm_vel[i]
-            obs[f"{j}.torque"] = arm_eff[i]
+            # obs[f"{j}.vel"] = arm_vel[i]
+            # obs[f"{j}.torque"] = arm_eff[i]
         for i, j in enumerate(self.config.hand_joint_names):
             obs[f"{j}.pos"] = hand_pos[i]
-            obs[f"{j}.vel"] = hand_vel[i]
-            obs[f"{j}.torque"] = hand_eff[i]
+            # obs[f"{j}.vel"] = hand_vel[i]
+            # obs[f"{j}.torque"] = hand_eff[i]
         return obs
-
-    def _hand_to_linker_range(self, val: float) -> float:
-        # mocap_to_linkerhand outputs LinkerHand L6 commands directly in [0, 255].
-        # Keep the robot side consistent by treating the incoming action as u8 values.
-        return max(0.0, min(255.0, round(float(val), 2)))
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected")
 
-        arm_pos = []
+        raw_arm_pos = []
         for j in self.config.arm_joint_names:
             key = f"{j}.pos"
             if key not in action:
                 raise ValueError(f"Missing action key: {key}")
-            arm_pos.append(float(action[key]))
+            raw_arm_pos.append(float(action[key]))
 
-        traj = JointTrajectory()
-        traj.header.stamp = self._node.get_clock().now().to_msg()
-        traj.joint_names = list(self.config.arm_joint_names)
-        point = JointTrajectoryPoint()
-        point.positions = arm_pos
-        point.time_from_start = Duration(seconds=0.1).to_msg()
-        traj.points = [point]
-        self._arm_pub.publish(traj)
+        with self._lock:
+            current_arm_msg = self._arm_state_msg
 
+        if current_arm_msg is None:
+            logger.warning("No joint state received yet. Sending raw action.")
+            safe_arm_pos = raw_arm_pos
+        else:
+            current_pos = _ordered_values(current_arm_msg, self.config.arm_joint_names, "position")
+
+            # If physical arm has been manually reset between episodes, clear stale EMA state.
+            if self._ema_arm_pos is not None:
+                max_diff = max(
+                    abs(self._ema_arm_pos[i] - current_pos[i])
+                    for i in range(len(current_pos))
+                )
+                if max_diff > 0.5:
+                    logger.info(
+                        "Large joint jump detected (episode reset). Resetting follower EMA state."
+                    )
+                    self._ema_arm_pos = None
+
+            if self._ema_arm_pos is None:
+                self._ema_arm_pos = current_pos.copy()
+
+            safe_arm_pos = []
+            for i in range(len(raw_arm_pos)):
+                # Filter command stream itself, decoupled from measured position.
+                smoothed_target = self._alpha * raw_arm_pos[i] + (1.0 - self._alpha) * self._ema_arm_pos[i]
+                cmd_step = smoothed_target - self._ema_arm_pos[i]
+
+                if cmd_step > self._max_dq_per_step:
+                    cmd_step = self._max_dq_per_step
+                elif cmd_step < -self._max_dq_per_step:
+                    cmd_step = -self._max_dq_per_step
+
+                safe_val = self._ema_arm_pos[i] + cmd_step
+                safe_arm_pos.append(safe_val)
+                self._ema_arm_pos[i] = safe_val
+
+        arm_msg = Float64MultiArray()
+        arm_msg.data = safe_arm_pos
+        self._arm_pub.publish(arm_msg)
+
+        # 4. 手爪控制逻辑：直接透传 action 值
         hand_pos = []
         for j in self.config.hand_joint_names:
             key = f"{j}.pos"
             if key not in action:
                 raise ValueError(f"Missing action key: {key}")
-            hand_pos.append(self._hand_to_linker_range(float(action[key])))
+            hand_pos.append(float(action[key]))
 
         hand_msg = JointState()
         hand_msg.header.stamp = self._node.get_clock().now().to_msg()
