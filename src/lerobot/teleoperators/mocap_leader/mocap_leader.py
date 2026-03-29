@@ -714,7 +714,11 @@ class MocapLeader(Teleoperator):
         return q_next - q_curr
 
     def reset_incremental_pose(self) -> None:
-        """Reset incremental state to avoid first-frame jumps across episode boundaries."""
+        """Reset incremental state to avoid first-frame jumps across episode boundaries.
+
+        Clears `_virtual_q` so the next cycle re-seeds from measured joints; clears
+        filtered delta so mocap LPF does not carry across episodes.
+        """
         with self._lock:
             self._virtual_q = None
             self._filtered_delta_x = None
@@ -756,7 +760,12 @@ class MocapLeader(Teleoperator):
             hand_pos, hand_quat = self._latest_arm_pose
 
         arm_pos_rad = self._ordered_arm_positions_rad()
-        q_curr = np.array(arm_pos_rad, dtype=np.float64)
+        q_measured = np.array(arm_pos_rad, dtype=np.float64)
+
+        # Virtual joint reference: IK linearizes and accumulates on this state instead of
+        # re-linearizing on measured q every cycle (decouples teleop from tracking lag).
+        if self._virtual_q is None:
+            self._virtual_q = q_measured.copy()
 
         if self._prev_hand_pose is None:
             delta_pos = (0.0, 0.0, 0.0)
@@ -815,13 +824,14 @@ class MocapLeader(Teleoperator):
         if delta_rot_norm > self._max_delta_rot_per_cycle and delta_rot_norm > 1e-12:
             delta_x[3:] *= self._max_delta_rot_per_cycle / delta_rot_norm
 
-        delta_q = self._compute_incremental_ik(q_curr=q_curr, delta_x=delta_x)
+        delta_q = self._compute_incremental_ik(q_curr=self._virtual_q, delta_x=delta_x)
         delta_q = np.clip(
             delta_q,
             -self._max_joint_step_per_cycle,
             self._max_joint_step_per_cycle,
         )
-        q_next = q_curr + delta_q
+        self._virtual_q = self._virtual_q + delta_q
+        q_next = self._virtual_q
         self._last_q_deg = np.rad2deg(q_next)
         self._debug_counter += 1
         if self._debug_counter % 30 == 0:

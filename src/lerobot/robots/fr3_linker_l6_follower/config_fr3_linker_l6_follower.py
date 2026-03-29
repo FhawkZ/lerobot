@@ -31,6 +31,9 @@ class FR3LinkerL6FollowerConfig(RobotConfig):
     hand_control_topic: str = "/cb_right_hand_control_cmd"
     hand_state_topic: str = "/cb_right_hand_state"
     enable_arm_publish: bool = True
+    # Match lerobot `dataset.fps` / teleop loop. Each trajectory point uses
+    # time_from_start = 1/control_hz so the segment length matches one command cycle.
+    control_hz: float = 30.0
     arm_joint_names: list[str] = field(
         default_factory=lambda: [
             "fr3_joint1",
