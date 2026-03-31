@@ -429,8 +429,8 @@ class MocapLeader(Teleoperator):
         self._max_delta_pos_per_cycle = 0.04  # m
         self._max_delta_rot_per_cycle = 0.30  # rad
         # Motion scaling + smoothing for clearer movement and less translation jitter.
-        self._delta_pos_gain = 1.8
-        self._delta_rot_gain = 1.4
+        self._delta_pos_gain = 1.6
+        self._delta_rot_gain = 1
         self._delta_lpf_alpha = 0.7
         self._filtered_delta_x: Optional[np.ndarray] = None
         self._debug_counter = 0

@@ -25,6 +25,7 @@ class FR3FollowerConfig(RobotConfig):
     """Configuration for Franka Research 3 follower arm (ROS2)."""
 
     joint_command_topic: str = "/NS_1/fr3_arm_controller/joint_trajectory"
+    # Gripper topics/params kept for config compatibility; fr3_follower.py does not use them.
     gripper_command_topic: str = "/NS_1/franka_gripper/gripper_action"
     joint_state_topic: str = "/NS_1/franka_robot_state_broadcaster/measured_joint_states"
     gripper_state_topic: str = "/NS_1/franka_gripper/joint_states"
@@ -39,7 +40,7 @@ class FR3FollowerConfig(RobotConfig):
             "fr3_joint7",
         ]
     )
-    use_gripper: bool = True
+    use_gripper: bool = False
     gripper_max_effort: float = 20.0
     gripper_width_scale: float = 0.5
     gripper_grasp_topic: str = "/NS_1/franka_gripper/grasp"
