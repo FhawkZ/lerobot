@@ -429,7 +429,7 @@ class MocapLeader(Teleoperator):
         self._max_delta_pos_per_cycle = 0.04  # m
         self._max_delta_rot_per_cycle = 0.30  # rad
         # Motion scaling + smoothing for clearer movement and less translation jitter.
-        self._delta_pos_gain = 1.6
+        self._delta_pos_gain = 1.4
         self._delta_rot_gain = 1
         self._delta_lpf_alpha = 0.7
         self._filtered_delta_x: Optional[np.ndarray] = None
@@ -716,11 +716,17 @@ class MocapLeader(Teleoperator):
     def reset_incremental_pose(self) -> None:
         """Reset incremental state to avoid first-frame jumps across episode boundaries.
 
-        Clears `_virtual_q` so the next cycle re-seeds from measured joints; clears
-        filtered delta so mocap LPF does not carry across episodes.
+        Re-seeds `_virtual_q` from current measured FR3 joints so leader starts from
+        follower's current arm state; clears filtered delta so mocap LPF does not
+        carry across episodes.
         """
+        q_seed: Optional[np.ndarray] = None
+        try:
+            q_seed = np.array(self._ordered_arm_positions_rad(), dtype=np.float64)
+        except Exception:
+            q_seed = None
         with self._lock:
-            self._virtual_q = None
+            self._virtual_q = q_seed
             self._filtered_delta_x = None
             if self._latest_arm_pose is not None:
                 hand_pos, hand_quat = self._latest_arm_pose

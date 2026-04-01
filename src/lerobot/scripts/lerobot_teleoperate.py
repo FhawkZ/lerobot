@@ -231,6 +231,10 @@ def teleoperate(cfg: TeleoperateConfig):
     teleop.connect()
     if robot is not None:
         robot.connect()
+        if hasattr(robot, "reset_motion_state"):
+            robot.reset_motion_state()
+    if hasattr(teleop, "reset_incremental_pose"):
+        teleop.reset_incremental_pose()
 
     try:
         teleop_loop(

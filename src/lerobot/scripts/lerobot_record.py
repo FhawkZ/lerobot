@@ -318,6 +318,10 @@ def record_loop(
                 t.reset_incremental_pose()
                 break
 
+    # Reset follower-side motion filter at each record/reset loop boundary.
+    if hasattr(robot, "reset_motion_state"):
+        robot.reset_motion_state()
+
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:

@@ -71,6 +71,7 @@ class FR3LinkerL6Follower(Robot):
 
         self._cmd_debug_counter = 0
         self._last_published_arm_pos: Optional[list[float]] = None
+        self._ema_arm_pos: Optional[list[float]] = None
 
     @property
     def observation_features(self) -> dict[str, type]:
@@ -123,6 +124,7 @@ class FR3LinkerL6Follower(Robot):
         self._connected = True
         self._cmd_debug_counter = 0
         self._last_published_arm_pos = None
+        self._ema_arm_pos = None
 
         hz = float(self.config.control_hz)
         traj_dt = 1.0 / hz if hz > 0 else 1.0 / 30.0
@@ -145,6 +147,11 @@ class FR3LinkerL6Follower(Robot):
 
     def configure(self) -> None:
         pass
+
+    def reset_motion_state(self) -> None:
+        """Reset follower-side filter state at episode boundaries."""
+        self._ema_arm_pos = None
+        self._last_published_arm_pos = None
 
     def _arm_state_cb(self, msg: JointState) -> None:
         with self._lock:
@@ -224,6 +231,17 @@ class FR3LinkerL6Follower(Robot):
             return action
 
         current_pos = _ordered_values(current_arm_msg, self.config.arm_joint_names, "position")
+        alpha = float(self.config.ema_alpha)
+        # Slightly reduce effective alpha to suppress occasional jitter spikes.
+        alpha = max(0.01, min(1.0, alpha * 0.7))
+        if self._ema_arm_pos is None:
+            # Seed EMA with measured state to avoid first-frame jump.
+            self._ema_arm_pos = list(current_pos)
+        safe_arm_pos = []
+        for i in range(len(raw_arm_pos)):
+            filtered = alpha * raw_arm_pos[i] + (1.0 - alpha) * self._ema_arm_pos[i]
+            safe_arm_pos.append(filtered)
+            self._ema_arm_pos[i] = filtered
 
         hz = float(self.config.control_hz)
         traj_dt_s = 1.0 / hz if hz > 0 else 1.0 / 30.0
@@ -232,7 +250,7 @@ class FR3LinkerL6Follower(Robot):
         arm_msg.header.stamp = self._node.get_clock().now().to_msg()
         arm_msg.joint_names = list(self.config.arm_joint_names)
         point = JointTrajectoryPoint()
-        point.positions = raw_arm_pos
+        point.positions = safe_arm_pos
         point.time_from_start = Duration(seconds=traj_dt_s).to_msg()
         arm_msg.points = [point]
         self._arm_pub.publish(arm_msg)
@@ -240,20 +258,24 @@ class FR3LinkerL6Follower(Robot):
         self._cmd_debug_counter += 1
         if self._cmd_debug_counter % 20 == 0:
             max_raw_to_meas = max(abs(raw_arm_pos[i] - current_pos[i]) for i in range(len(raw_arm_pos)))
+            max_safe_to_meas = max(
+                abs(safe_arm_pos[i] - current_pos[i]) for i in range(len(safe_arm_pos))
+            )
             max_cmd_step = 0.0
             if self._last_published_arm_pos is not None:
                 max_cmd_step = max(
-                    abs(raw_arm_pos[i] - self._last_published_arm_pos[i])
-                    for i in range(len(raw_arm_pos))
+                    abs(safe_arm_pos[i] - self._last_published_arm_pos[i])
+                    for i in range(len(safe_arm_pos))
                 )
             logger.info(
-                "Send FR3 cmd(rad)=%s max|raw-meas|=%.5f max|cmd_step|=%.5f traj_dt=%.4fs",
-                [round(v, 4) for v in raw_arm_pos],
+                "Send FR3 cmd(rad)=%s max|raw-meas|=%.5f max|safe-meas|=%.5f max|cmd_step|=%.5f traj_dt=%.4fs",
+                [round(v, 4) for v in safe_arm_pos],
                 max_raw_to_meas,
+                max_safe_to_meas,
                 max_cmd_step,
                 traj_dt_s,
             )
-        self._last_published_arm_pos = list(raw_arm_pos)
+        self._last_published_arm_pos = list(safe_arm_pos)
 
         hand_pos = []
         for j in self.config.hand_joint_names:
